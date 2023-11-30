@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o pipefail
+set -o nounset
+# set -o xtrace
+
+# TODO: args with sensible defaults
+RELEASEVER=7.7.1908
+RELEASEMAJ="${RELEASEVER%%.*}"
+
+LUSTRECLIENT=0
+LUSTRESERVER=0
+LUSTREVER=2.10.8
+LUSTREMIRROR="https://downloads.whamcloud.com"
+#OUTPUT="$(pwd)/../image/"
+OUTPUT="/localData/Development/image"
+MIRROR="http://mirror.centos.org"
+PACKAGELIST=centos.pkgs
+PACKAGEGROUPLIST=centos_groups.pkgs
+# directory / ostree to copy into the image
+# node_skeleton = default ostree
+# node_build = any artifact added through the image build process, e.g. yum repo for lustre
+EXTRA_TREES=("node_skeleton" "node_build")
+
+msg() {
+    ALL_OFF="\e[1;0m"
+    BOLD="\e[1;1m"
+    GREEN="${BOLD}\e[1;32m"
+    local mesg=$1; shift
+    printf "${GREEN}==>${ALL_OFF}${BOLD} ${mesg}${ALL_OFF}\n" "$@" >&2
+}
+
+function compile_fakeuname {
+    [ -e ./fake_uname.so ]  && return 0
+    cat >./fake_uname.c <<EOF
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+int uname(struct utsname *buf) {
+    int ret;
+    ret = syscall(SYS_uname, buf);
+    char *fake_kern_ver = NULL;
+    fake_kern_ver = (char *)getenv("FAKE_KERN");
+    if (fake_kern_ver != NULL) {
+        strcpy(buf->release, fake_kern_ver);
+    }
+    return ret;
+}
+EOF
+    gcc -Wall -fPIC -g -c -DLINUX -Wall ./fake_uname.c && gcc -shared -rdynamic  -o ./fake_uname.so ./fake_uname.o -ldl
+    rm -f ./fake_uname.c
+    rm -f ./fake_uname.o
+}
+
+# only run as root....
+[[ $(id -u) -ne 0 ]] && ( msg "ERROR: $0 must be run as root" && exit 1)
+
+
+# compile fake_uname
+compile_fakeuname
+[[ ! -e ./fake_uname.so  ]] && ( msg "ERROR: $0 Cannot find fake_uname.so library" && exit 1 )
+
+# check that mkimage is being run from the script basedir
+SCRIPTPATH=$(dirname $(readlink -f "$0"))
+[[ $(pwd) != "$SCRIPTPATH" ]] && ( msg "ERROR: must execute mkimage from $SCRIPTPATH" && exit 1 )
+
+# write a yum configuration file for our targeted releasever
+yum_config() {
+    if [ $RELEASEMAJ == "8" ]; then
+      release_url="baseurl=${MIRROR}/centos/${RELEASEVER}/BaseOS/x86_64/os/"
+      updates_url="baseurl=${MIRROR}/centos/${RELEASEVER}/BaseOS/x86_64/os/"
+      extras_url="baseurl=${MIRROR}/centos/${RELEASEVER}/extras/x86_64/os/"
+      centosplus_url="baseurl=${MIRROR}/centos/${RELEASEVER}/centosplus/x86_64/os"
+      epel_url="baseurl=http://download.fedoraproject.org/pub/epel/${RELEASEMAJ}/Everything/x86_64"
+      gpg_key="https://www.centos.org/keys/RPM-GPG-KEY-CentOS-${RELEASEMAJ}"
+      gpg_key="https://www.centos.org/keys/RPM-GPG-KEY-CentOS-Official"
+      epel_gpg_key="https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-${RELEASEMAJ}"
+   else
+      release_url="baseurl=${MIRROR}/centos/${RELEASEVER}/os/x86_64"
+      updates_url="baseurl=${MIRROR}/centos/${RELEASEVER}/updates/x86_64/"
+      extras_url="baseurl=${MIRROR}/centos/${RELEASEVER}/extras/x86_64/"
+      centosplus_url="baseurl=${MIRROR}/centos/${RELEASEVER}/centosplus/x86_64/"
+      epel_url="baseurl=http://download.fedoraproject.org/pub/epel/${RELEASEMAJ}/x86_64"
+      gpg_key="https://www.centos.org/keys/RPM-GPG-KEY-CentOS-${RELEASEMAJ}"
+      epel_gpg_key="https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-${RELEASEMAJ}"
+      # currently lustre only supports el7
+      lustre_client_url="baseurl=${LUSTREMIRROR}/public/lustre/lustre-${LUSTREVER}/el${RELEASEVER}/client"
+      lustre_server_url="baseurl=${LUSTREMIRROR}/public/lustre/lustre-${LUSTREVER}/el${RELEASEVER}/server"
+    fi
+
+cat << EOF > image_yum.conf
+
+[main]
+gpgcheck=1
+
+[base]
+name=CentOS-${RELEASEVER} - Base
+${release_url}
+gpgkey=${gpg_key}
+
+[updates]
+name=CentOS-${RELEASEVER} - Updates
+${updates_url}
+gpgkey=${gpg_key}
+
+[extras]
+name=CentOS-${RELEASEVER} - Extras
+${extras_url}
+gpgkey=${gpg_key}
+
+[centosplus]
+name=CentOS-${RELEASEVER} - Plus
+${centosplus_url}
+gpgkey=${gpg_key}
+
+[epel]
+name=Extra Packages for Enterprise Linux ${RELEASEMAJ} - \$basearch
+${epel_url}
+gpgkey=${epel_gpg_key}
+
+
+EOF
+
+
+}
+
+yum_config
+
+# TODO: handle output redirection
+nspawn() {
+    systemd-nspawn -D ${OUTPUT} --quiet --register=no $*
+    # 1> /dev/null 2>&1
+}
+
+service() {
+   local action=$*
+   # TODO: handle exceptions here / remove || true
+   nspawn -D ${OUTPUT} systemctl "${action}"  || true
+}
+
+set_root_passwd() {
+  # TODO: store pw hash elsewhere..
+  # or passwd root < pass-root
+  local hashpw='$6$i9'
+  sed -i "s,^root:[^:]*:,root:${hashpw}:," ${OUTPUT}/etc/shadow
+}
+
+clean_yum_metadata() {
+  msg "Cleaning yum metadata"
+  rm -rf ${OUTPUT}/var/lib/yum/*
+  rm -rf ${OUTPUT}/var/log/yum.*
+  rm -rf ${OUTPUT}/var/cache/yum/*
+}
+
+# TODO:
+# wget https://downloadmirror.intel.com/25439/eng/Syscfg_V13_1_Build17_AllOS.zip
+
+# read entire package list from file "PACKAGELIST"
+[[ -f "${PACKAGELIST}" ]] || ( msg "ERROR: $PACKAGELIST does not exist" && exit 1 )
+
+mapfile -t package_list < $PACKAGELIST
+mapfile -t package_group_list < $PACKAGEGROUPLIST
+
+#  install centos into a directory
+  #--enablerepo="base" \
+  #--enablerepo="updates" \
+  #--enablerepo="epel" \
+  #"--disablerepo=*" \
+yum --config image_yum.conf --releasever=${RELEASEVER} \
+  --disablerepo='*' \
+  --enablerepo=base \
+  --enablerepo=updates \
+  --enablerepo=epel \
+  --installroot=${OUTPUT} install -y ${package_list[@]}
+
+if [[ -n $package_group_list ]]; then
+  yum --config image_yum.conf --releasever=${RELEASEVER} \
+    --disablerepo='*' \
+    --enablerepo=base \
+    --enablerepo=updates \
+    --enablerepo=epel \
+    --installroot=${OUTPUT} groupinstall -y ${package_group_list[@]}
+fi
+
+# lock yum version to our $RELEASEVER to stop automatic
+# yum upgrade to newer release.
+# the default is releasever=7 we want to ensure minor vers
+# obeyed
+msg "setting ${RELEASEVER} as /etc/yum/vars/releasever"
+echo ${RELEASEVER} > ${OUTPUT}/etc/yum/vars/releasever
+
+# mirrorlist doesn't work with $releasever including minor version (e.g. 7.6.1810)
+# mirror.centos.org has paths for the minor version so use those
+# TODO: use local repo 
+msg 'removing mirrorlist from /etc/yum.repos.d/CentOS-Base.repo'
+sed -i "s/^mirrorlist/#mirrorlist/g" ${OUTPUT}/etc/yum.repos.d/CentOS-Base.repo
+sed -i "s/^#baseurl/baseurl/g" ${OUTPUT}/etc/yum.repos.d/CentOS-Base.repo
+sed -i "s#http://mirror.centos.org#${MIRROR}#g" ${OUTPUT}/etc/yum.repos.d/CentOS-Base.repo
+
+# setup nsswitch for sudo
+# TODO: why isn't this in templates?
+if grep -q ^sudoers ${OUTPUT}/etc/nsswitch.conf; then
+	# append 'sss' to the end of the line if it's not found already
+    sed -i --regexp-extended '
+          /^(sudoers):/ {
+            /\bsss\b/! s/$/ sss/
+          }
+        ' ${OUTPUT}/etc/nsswitch.conf
+else
+    echo "sudoers:        sss files" >> ${OUTPUT}/etc/nsswitch.conf
+fi
+
+# network.service - disable we manually configure nics in initrd.
+disable_svc="network.service lm_sensors"
+msg "disabling service(s): ${disable_svc}"
+service "disable" "${disable_svc}"
+
+#TODO: check vendor preset, this may not be required at all...
+enable_svc="ntpd.service ntpdate.service sshd.service sssd.service rsyslog.service crond.service postfix.service kdump.service autofs.service irqbalance.service xinetd.service"
+msg "enabling service(s): ${enable_svc}"
+service "enable" "${enable_svc}"
+
+# TODO: perhaps do this in skeleton file? not needed / already in templates maybe?
+msg 'setting PermitRootLogin yes /etc/ssh/sshd_config'
+sed -i 's/^.*PermitRootLogin.*$/PermitRootLogin yes/' ${OUTPUT}/etc/ssh/sshd_config
+
+if [ ! -z "$EXTRA_TREES" ]; then
+  for tree in "${EXTRA_TREES[@]}"; do
+    msg "copy EXTRA_TREES from $tree"
+    cp -avr ${tree}/* $OUTPUT/
+  done
+else
+  msg "EXTRA_TREES unset.. skipping.."
+fi
+
+#msg 'setting root pw'
+#set_root_passwd
+
+# copy our kernel to /pxe/<image name/ currently assumes this is up one directory
+# TODO: configurable path to final image loction
+msg "copying kernel from ${OUTPUT}/boot/kernel/vmlinuz"
+CWD=$(pwd)
+cd $OUTPUT
+BASENAME=$(basename $(pwd))
+cd ..
+cp -va ${BASENAME}/boot/vmlinuz* .
+KERNEL=$(ls vmlinuz-*)
+ln -vsf ${KERNEL} vmlinuz
+cd $CWD
+
+msg "saving installed rpm versions to rpm/"
+mkdir -p rpm/
+nspawn rpm -qa > rpm/versions-$(date +"%Y%m%d%H%M%S")
+
+# Get installed kernel version for fake_uname
+KERNEL_VERSION=$(nspawn rpm -q kernel --qf '%{VERSION}-%{RELEASE}.%{ARCH}')
+
+echo $KERNEL_VERSION
+
+cp ./fake_uname.so $OUTPUT/usr/lib64
+cp ./fake_uname.so /usr/lib64
+
+# install lustre
+cp -va $CWD/scripts/compile_lustre.sh $OUTPUT/root/compile_lustre.sh
+
+
+FAKE_KERN=$KERNEL_VERSION LD_PRELOAD=fake_uname.so nspawn --setenv FAKE_KERN=$KERNEL_VERSION --setenv LD_PRELOAD=fake_uname.so "bash /root/compile_lustre.sh"
+
+cp -va $CWD/scripts/i40e.sh $OUTPUT/root/i40e.sh
+FAKE_KERN=$KERNEL_VERSION LD_PRELOAD=fake_uname.so nspawn --setenv FAKE_KERN=$KERNEL_VERSION --setenv LD_PRELOAD=fake_uname.so "bash /root/i40e.sh"
+
+
+clean_yum_metadata
+
+msg "finished - image saved to $OUTPUT"
+
+# du to array, throwaway the path on print
+image_size=($(du -sh $OUTPUT))
+msg "resulting image size is: ${image_size[0]}"
+
